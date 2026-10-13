@@ -1,40 +1,31 @@
-"""Stylized Normals toolkit for Substance 3D Painter.
+"""Stylized normal-map generator for Substance 3D Painter.
 
 A single-file plugin that adds a "Stylized Normals" panel to Substance 3D
-Painter. It bundles the three things you need to get a hand-painted / stylized
-look driven by surface normals:
+Painter. It generates tileable, hand-painted looking normal maps and applies
+them straight to the Normal *mesh map* of the active Texture Set - no need to
+drag the texture onto a layer yourself.
 
-  1. Normal channel setup
-     Makes sure the active Texture Set has a Normal channel (and optionally a
-     Height channel) configured so you can paint normal detail by hand.
+Three ways to make the height field that drives the normals:
 
-  2. Procedural stylized normal maps
-     Generates tileable, hand-painted style normal maps (painterly strokes,
-     chunky facets, waves, cracks) as PNG images and imports them into the
-     project so you can drag them onto a fill layer's Normal channel.
+  * Procedural pattern - a sum of tileable sine waves (Painterly / Waves /
+    Chunky / Cracks), with control over scale, octaves, strength and seed.
+  * Base material - reads the Texture Set's composited base color (via the
+    scripting API's map export) and turns its luminance into a height field, so
+    the stylized bumps follow whatever you have already painted.
+  * Base material + pattern detail - blends the two, so the pattern adds detail
+    on top of the painted material.
 
-  3. A stylized custom shader
-     Installs a GLSL surface shader into your shelf that shades the model with
-     quantized "toon" lighting taken from the painted normals. It also offers a
-     "Normal debug" view so you can see the painted normals directly.
-
---------------------------------------------------------------------------
-Why the panel does what it does (an important limitation)
---------------------------------------------------------------------------
-Substance 3D Painter's scripting APIs (the Python `substance_painter` package
-and the legacy JavaScript `alg.*` API) can read and change *channels*, *mesh
-maps*, *resolution*, *resources* and *shaders*, but they cannot create or edit
-paint/fill *layers* or *effects* in the layer stack. So this toolkit can't draw
-normal strokes into the layer stack for you; instead it sets up the Normal
-channel, generates normal maps you can apply, and gives you a stylized shader.
+The generated map is written to your shelf (so it persists and shows up in the
+Assets window), imported into the project, and assigned as the Normal mesh map
+of the active Texture Set.
 
 Install:
   1. Copy this file into Painter's Python plugin folder, for example:
      .../Documents/Adobe/Adobe Substance 3D Painter/python/plugins/
   2. Start Substance 3D Painter.
   3. Open the "Python" menu and enable "stylized_normals".
-  4. The "Stylized Normals" panel appears; drag it wherever you like (or click
-     the toolbar button / use Window > "Show Stylized Normals panel").
+  4. The "Stylized Normals" panel appears (also a toolbar button and a
+     Window > "Show Stylized Normals panel" entry).
 
 Painter 10.1+ uses Qt6 (PySide6) while older versions use Qt5 (PySide2). This
 file picks the right binding automatically.
@@ -45,11 +36,11 @@ import os
 import random
 import struct
 import sys
+import tempfile
 import zlib
 
 import substance_painter.application
 import substance_painter.js
-import substance_painter.logging
 import substance_painter.project
 import substance_painter.resource
 import substance_painter.textureset
@@ -70,8 +61,6 @@ else:
 PANEL_NAME = "StylizedNormalsPanel"  # Unique name so Painter remembers the dock.
 _END = QtGui.QTextCursor.MoveOperation.End  # Cursor position: end of document.
 
-SHADER_FILE_NAME = "stylized_normals.glsl"  # Name of the shader on disk / shelf.
-
 # Module level handles (kept so we can clean everything up on unload).
 _output_box = None  # Text box that mirrors print() output.
 _original_stdout = None  # Saved so print() can be restored on unload.
@@ -79,17 +68,53 @@ _panel = None  # The widget we dock.
 _dock = None  # The QDockWidget Painter wraps it in (used to re-show it).
 _toolbar_button = None  # The one-click button on the plugins toolbar.
 _menu_action = None  # The Window-menu entry.
-_style_combo = None  # Normal-map style selector.
-_size_combo = None  # Normal-map size selector.
-_strength_spin = None  # Normal-map strength selector.
-_seed_spin = None  # Normal-map random seed selector.
+_source_combo = None  # Height source: procedural / base material / hybrid.
+_pattern_combo = None  # Procedural pattern style.
+_size_combo = None  # Output size.
+_strength_spin = None  # Bump strength.
+_scale_spin = None  # Pattern frequency multiplier.
+_octaves_spin = None  # Number of fractal detail levels.
+_detail_spin = None  # How much pattern detail to mix into the base material.
+_contrast_spin = None  # Height contrast (percent).
+_seed_spin = None  # Random seed.
+_invert_check = None  # Invert the height field.
+
+TWO_PI = 2.0 * math.pi
+
+# Base integer frequencies for each procedural style. Integer frequencies keep
+# the pattern seamless / tileable across the UV island. "ridged" styles turn
+# the sine into sharp creases (used by the "Cracks" look).
+STYLE_DEFINITIONS = {
+    "painterly": {
+        "label": "Painterly strokes",
+        "waves": [(1, 3, 0.9), (2, 5, 0.6), (1, 8, 0.4)],
+        "ridged": False,
+        "quantize": 0.0,
+    },
+    "waves": {
+        "label": "Waves (soft bumps)",
+        "waves": [(1, 1, 0.8), (2, -1, 0.6), (1, 2, 0.5)],
+        "ridged": False,
+        "quantize": 0.0,
+    },
+    "chunky": {
+        "label": "Chunky (flat facets)",
+        "waves": [(1, 1, 0.7), (2, 1, 0.6)],
+        "ridged": False,
+        "quantize": 3.0,
+    },
+    "cracks": {
+        "label": "Cracks (sharp creases)",
+        "waves": [(2, 2, 0.8), (3, -2, 0.7), (2, 3, 0.6)],
+        "ridged": True,
+        "quantize": 0.0,
+    },
+}
 
 
 # ==========================================================================
-# Pure helpers: PNG writing and normal-map generation.
-#
-# These functions never touch the Painter API, which means they can be tested
-# outside of Painter (see the bottom of this file for a self test).
+# Pure helpers: PNG read/write. These never touch the Painter API, so they can
+# be tested outside Painter (see the bottom of this file).
 # ==========================================================================
 def _png_chunk(tag, data):
     """Build a single PNG chunk: length + tag + data + CRC32."""
@@ -102,32 +127,23 @@ def write_png(file_path, width, height, rgb_bytes):
 
     Painter's embedded Python ships without PIL/numpy, but the standard library
     has `zlib` and `struct`, which is all a PNG needs.
-
-    Args:
-        file_path (str): Destination file path.
-        width (int): Image width in pixels.
-        height (int): Image height in pixels.
-        rgb_bytes (bytes): Row-major RGB data, length = width * height * 3.
     """
     expected = width * height * 3
     if len(rgb_bytes) != expected:
         raise ValueError(
             "rgb_bytes has %d bytes, expected %d." % (len(rgb_bytes), expected))
 
-    # Raw image = one filter byte (0 = "None") followed by each row of pixels.
     stride = width * 3
     raw = bytearray()
     for y in range(height):
-        raw.append(0)
+        raw.append(0)  # filter type 0 ("None")
         raw += rgb_bytes[y * stride:(y + 1) * stride]
 
     ihdr = struct.pack(">IIBBBBB",
                        width, height,
                        8,   # bit depth
                        2,   # color type 2 = truecolor (RGB)
-                       0,   # compression method
-                       0,   # filter method
-                       0)   # interlace method
+                       0, 0, 0)
     png = (b"\x89PNG\r\n\x1a\n" +
            _png_chunk(b"IHDR", ihdr) +
            _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
@@ -136,50 +152,127 @@ def write_png(file_path, width, height, rgb_bytes):
         handle.write(png)
 
 
-def _make_waves(rnd, count, fu_range, fv_range):
-    """Pick a handful of tileable sine waves (integer frequencies).
+def read_png(file_path):
+    """Read an 8-bit PNG and return (width, height, rgb_bytes).
 
-    Integer frequencies make the pattern repeat seamlessly, so the resulting
-    normal map is tileable across the UV island.
-
-    Returns:
-        list[tuple]: (fu, fv, amplitude, phase) for each wave.
+    Supports greyscale, greyscale+alpha, RGB and RGBA at 8 bits per channel,
+    which covers the maps Painter's `alg.mapexport.save` produces. Only the
+    standard library is used.
     """
+    with open(file_path, "rb") as handle:
+        data = handle.read()
+
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("Not a PNG file: %s" % file_path)
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    idat = bytearray()
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length  # 4 length + 4 tag + data + 4 CRC
+        if tag == b"IHDR":
+            (width, height, bit_depth, color_type,
+             _comp, _filt, _interlace) = struct.unpack(">IIBBBBB", chunk)
+        elif tag == b"IDAT":
+            idat += chunk
+        elif tag == b"IEND":
+            break
+
+    if bit_depth != 8:
+        raise ValueError("Only 8-bit PNGs are supported (got %s)." % bit_depth)
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
+    if channels is None:
+        raise ValueError("Unsupported PNG color type: %s" % color_type)
+
+    raw = zlib.decompress(bytes(idat))
+    stride = width * channels
+
+    # Undo the per-scanline filters (PNG spec: None/Sub/Up/Average/Paeth).
+    out = bytearray(height * stride)
+    prev = bytearray(stride)
+    pointer = 0
+    for y in range(height):
+        filter_type = raw[pointer]
+        pointer += 1
+        line = bytearray(raw[pointer:pointer + stride])
+        pointer += stride
+        if filter_type == 1:  # Sub
+            for i in range(channels, stride):
+                line[i] = (line[i] + line[i - channels]) & 0xFF
+        elif filter_type == 2:  # Up
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif filter_type == 3:  # Average
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif filter_type == 4:  # Paeth
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                up = prev[i]
+                up_left = prev[i - channels] if i >= channels else 0
+                p = left + up - up_left
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+                if pa <= pb and pa <= pc:
+                    pred = left
+                elif pb <= pc:
+                    pred = up
+                else:
+                    pred = up_left
+                line[i] = (line[i] + pred) & 0xFF
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+
+    # Flatten to RGB.
+    rgb = bytearray(width * height * 3)
+    j = 0
+    for i in range(0, len(out), channels):
+        if channels == 1 or channels == 2:
+            value = out[i]
+            rgb[j] = value
+            rgb[j + 1] = value
+            rgb[j + 2] = value
+        else:
+            rgb[j] = out[i]
+            rgb[j + 1] = out[i + 1]
+            rgb[j + 2] = out[i + 2]
+        j += 3
+    return width, height, bytes(rgb)
+
+
+# ==========================================================================
+# Pure helpers: height-field generation and normal encoding.
+# ==========================================================================
+def _build_waves(style, rnd, scale, octaves):
+    """Build a list of (fu, fv, amplitude, phase) waves for a style.
+
+    `scale` multiplies the base integer frequencies and `octaves` adds
+    higher-frequency, lower-amplitude copies (fractal detail). All frequencies
+    stay integers, which keeps the result tileable.
+    """
+    definition = STYLE_DEFINITIONS[style]
     waves = []
-    for _ in range(count):
-        fu = rnd.randint(fu_range[0], fu_range[1])
-        fv = rnd.randint(fv_range[0], fv_range[1])
-        if fu == 0 and fv == 0:
-            fu = 1
-        # Higher frequencies get a smaller amplitude, like fBm noise.
-        amplitude = 1.0 / math.sqrt(fu * fu + fv * fv + 1.0)
-        phase = rnd.uniform(0.0, 2.0 * math.pi)
-        waves.append((fu, fv, amplitude, phase))
+    amplitude = 1.0
+    for octave in range(max(1, octaves)):
+        factor = scale * (2 ** octave)
+        for base_fu, base_fv, base_amp in definition["waves"]:
+            fu = base_fu * factor
+            fv = base_fv * factor
+            phase = rnd.uniform(0.0, TWO_PI)
+            waves.append((fu, fv, base_amp * amplitude, phase))
+        amplitude *= 0.5
     return waves
 
 
-def _height_field(style, size, seed):
-    """Build a [0, 1] height field for the requested style.
-
-    Args:
-        style (str): One of the keys of STYLE_DESCRIPTIONS.
-        size (int): Width and height in pixels (square).
-        seed (int): Random seed for reproducibility.
-
-    Returns:
-        list[float]: size * size values in the [0, 1] range, row-major.
-    """
+def _procedural_height(style, size, seed, scale, octaves):
+    """Return a [0, 1] height field for a procedural style, row-major."""
+    definition = STYLE_DEFINITIONS[style]
     rnd = random.Random(seed)
-    two_pi = 2.0 * math.pi
-
-    if style == "painterly":
-        waves = _make_waves(rnd, 5, (1, 2), (3, 6))  # stretched strokes
-    elif style == "chunky":
-        waves = _make_waves(rnd, 4, (1, 3), (1, 3))
-    elif style == "cracks":
-        waves = _make_waves(rnd, 7, (2, 5), (2, 5))
-    else:  # "waves"
-        waves = _make_waves(rnd, 5, (1, 3), (1, 3))
+    waves = _build_waves(style, rnd, scale, octaves)
+    ridged = definition["ridged"]
 
     values = [0.0] * (size * size)
     index = 0
@@ -188,47 +281,59 @@ def _height_field(style, size, seed):
         for x in range(size):
             u = x / float(size)
             accumulator = 0.0
-            if style == "cracks":
-                # Ridged pattern: sharp crests look like painted cracks.
-                for fu, fv, amplitude, phase in waves:
-                    accumulator += amplitude * (
-                        1.0 - abs(math.sin(two_pi * (fu * u + fv * v) + phase)))
-            else:
-                for fu, fv, amplitude, phase in waves:
-                    accumulator += amplitude * math.sin(
-                        two_pi * (fu * u + fv * v) + phase)
+            for fu, fv, amplitude, phase in waves:
+                wave = math.sin(TWO_PI * (fu * u + fv * v) + phase)
+                if ridged:
+                    wave = 1.0 - abs(wave)
+                accumulator += amplitude * wave
             values[index] = accumulator
             index += 1
 
-    # Normalize to [0, 1].
+    _normalize(values)
+    quantize = definition["quantize"]
+    if quantize:
+        for i, value in enumerate(values):
+            values[i] = round(value * quantize) / quantize
+    return values
+
+
+def _luminance_height(width, height, rgb_bytes):
+    """Turn an RGB image into a [0, 1] luminance height field, row-major."""
+    count = width * height
+    values = [0.0] * count
+    for i in range(count):
+        r = rgb_bytes[i * 3] / 255.0
+        g = rgb_bytes[i * 3 + 1] / 255.0
+        b = rgb_bytes[i * 3 + 2] / 255.0
+        values[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    _normalize(values)
+    return values
+
+
+def _normalize(values):
+    """Rescale a list of floats in place so it spans the [0, 1] range."""
     low = min(values)
     high = max(values)
     span = (high - low) or 1.0
     for i, value in enumerate(values):
         values[i] = (value - low) / span
 
-    # Chunky style: quantize into flat facets for a folded-paper look.
-    if style == "chunky":
-        levels = 5.0
-        for i, value in enumerate(values):
-            values[i] = round(value * levels) / levels
 
-    return values
+def _apply_tone(values, invert, contrast):
+    """Apply invert and contrast (around 0.5) to a [0, 1] height field."""
+    for i, value in enumerate(values):
+        if invert:
+            value = 1.0 - value
+        value = (value - 0.5) * contrast + 0.5
+        values[i] = 0.0 if value < 0.0 else (1.0 if value > 1.0 else value)
 
 
-def generate_normal_map(style, size, strength, seed):
-    """Generate a tileable normal map (as raw RGB bytes) from a height field.
+def _height_to_normal(values, size, strength):
+    """Convert a [0, 1] height field into tileable normal-map RGB bytes.
 
-    Args:
-        style (str): Style key (see STYLE_DESCRIPTIONS).
-        size (int): Square image size in pixels.
-        strength (float): Bump strength multiplier.
-        seed (int): Random seed.
-
-    Returns:
-        bytes: Row-major RGB data, length = size * size * 3.
+    Finite differences with wrap-around sampling (for tileability) give the
+    slope in U and V; the slope becomes the X/Y tilt of the normal.
     """
-    heights = _height_field(style, size, seed)
     out = bytearray(size * size * 3)
     index = 0
     for y in range(size):
@@ -238,191 +343,66 @@ def generate_normal_map(style, size, strength, seed):
             x_left = (x - 1) % size
             x_right = (x + 1) % size
 
-            dh_dx = heights[y * size + x_right] - heights[y * size + x_left]
-            dh_dy = heights[y_down * size + x] - heights[y_up * size + x]
+            dh_dx = values[y * size + x_right] - values[y * size + x_left]
+            dh_dy = values[y_down * size + x] - values[y_up * size + x]
 
             nx = -dh_dx * strength
             ny = -dh_dy * strength
             nz = 1.0
             length = math.sqrt(nx * nx + ny * ny + nz * nz)
-            nx /= length
-            ny /= length
-            nz /= length
 
-            out[index] = int(max(0, min(255, (nx * 0.5 + 0.5) * 255.0)))
-            out[index + 1] = int(max(0, min(255, (ny * 0.5 + 0.5) * 255.0)))
-            out[index + 2] = int(max(0, min(255, (nz * 0.5 + 0.5) * 255.0)))
+            out[index] = int(max(0, min(255, (nx / length * 0.5 + 0.5) * 255.0)))
+            out[index + 1] = int(max(0, min(255, (ny / length * 0.5 + 0.5) * 255.0)))
+            out[index + 2] = int(max(0, min(255, (nz / length * 0.5 + 0.5) * 255.0)))
             index += 3
     return bytes(out)
 
 
-STYLE_DESCRIPTIONS = {
-    "painterly": "Painterly strokes (stretched ridges)",
-    "waves": "Waves (soft rounded bumps)",
-    "chunky": "Chunky (flat folded facets)",
-    "cracks": "Cracks (sharp painted creases)",
-}
+def generate_normal_map(source, style, size, strength, scale, octaves, seed,
+                        detail, contrast, invert, base_rgb=None):
+    """Generate a stylized normal map as raw RGB bytes.
 
+    Args:
+        source (str): "procedural", "material" or "hybrid".
+        style (str): Key into STYLE_DEFINITIONS (procedural pattern).
+        size (int): Square output size in pixels.
+        strength (float): Bump strength multiplier.
+        scale (int): Pattern frequency multiplier.
+        octaves (int): Number of fractal detail levels.
+        seed (int): Random seed for the procedural pattern.
+        detail (float): 0..1 mix of pattern detail into the base material.
+        contrast (float): Height contrast multiplier (1.0 = unchanged).
+        invert (bool): Invert the height field.
+        base_rgb (bytes): Required when source is "material" or "hybrid";
+            the base color image (size * size * 3 bytes, same size).
 
-# ==========================================================================
-# The stylized shader that gets written into the shelf.
-# ==========================================================================
-STYLIZED_SHADER = r'''// Stylized normals shader - generated by stylized_normals.py
-//
-// Shades the model with a quantized ("toon") light response plus a live,
-// procedural stylized-normal pattern. Switching the "Pattern" combobox in
-// Display Settings > Shaders (or in the shader's properties) updates the
-// viewport immediately - no need to regenerate or re-apply any bitmap.
-//
-// Pick it in Display Settings > Shaders, or use the "Apply stylized shader"
-// button in the toolkit panel.
+    Returns:
+        bytes: Row-major RGB data, length = size * size * 3.
+    """
+    needs_material = source in ("material", "hybrid")
+    needs_pattern = source in ("procedural", "hybrid")
 
-import lib-sampler.glsl
-import lib-normal.glsl
+    material_height = None
+    if needs_material:
+        if base_rgb is None:
+            raise ValueError("base_rgb is required for the '%s' source." % source)
+        material_height = _luminance_height(size, size, base_rgb)
 
-//: param auto world_eye_position
-uniform vec3 camera_pos;
+    pattern_height = None
+    if needs_pattern:
+        pattern_height = _procedural_height(style, size, seed, scale, octaves)
 
-//: param auto channel_basecolor
-uniform SamplerSparse basecolor_tex;
+    if source == "procedural":
+        heights = pattern_height
+    elif source == "material":
+        heights = material_height
+    else:  # hybrid
+        heights = [(1.0 - detail) * m + detail * p
+                   for m, p in zip(material_height, pattern_height)]
+        _normalize(heights)
 
-//: param custom {
-//:   "default": 0,
-//:   "label": "Shading mode",
-//:   "widget": "combobox",
-//:   "values": {
-//:     "Toon": 0,
-//:     "Flat (unlit)": 1,
-//:     "Normal debug": 2
-//:   }
-//: }
-uniform int shading_mode;
-
-//: param custom {
-//:   "default": 4,
-//:   "label": "Pattern",
-//:   "widget": "combobox",
-//:   "values": {
-//:     "Painterly": 0,
-//:     "Waves": 1,
-//:     "Chunky": 2,
-//:     "Cracks": 3,
-//:     "Off (painted normals only)": 4
-//:   }
-//: }
-uniform int pattern;
-
-//: param custom { "default": 6.0, "min": 0.5, "max": 40.0, "label": "Pattern scale" }
-uniform float pattern_scale;
-
-//: param custom { "default": 0.25, "min": 0.0, "max": 2.0, "label": "Pattern strength" }
-uniform float pattern_strength;
-
-//: param custom { "default": 4.0, "min": 2.0, "max": 24.0, "label": "Toon steps" }
-uniform float toon_steps;
-
-//: param custom { "default": 1.0, "min": 0.0, "max": 3.0, "label": "Light intensity" }
-uniform float light_intensity;
-
-//: param custom { "default": 0.15, "min": 0.0, "max": 1.0, "label": "Ambient" }
-uniform float ambient;
-
-//: param custom { "default": 0.0, "min": 0.0, "max": 0.5, "label": "Outline (0 = off)" }
-uniform float outline_thickness;
-
-const vec3 light_dir = normalize(vec3(0.4, 0.8, 0.6));
-const float TWO_PI = 6.2831853;
-
-// A tileable height field for each stylized pattern. Same idea as the maps the
-// Python toolkit generates (sums of integer-frequency sine waves), evaluated
-// live in the shader so the style can change without regenerating a bitmap.
-float patternHeight(vec2 uv, int style)
-{
-  float value = 0.0;
-
-  if (style == 0) {
-    // Painterly: few, stretched, low-frequency strokes.
-    value += 0.9 * sin(TWO_PI * (1.0 * uv.x + 3.0 * uv.y) + 0.5);
-    value += 0.6 * sin(TWO_PI * (2.0 * uv.x + 5.0 * uv.y) + 2.1);
-    value += 0.4 * sin(TWO_PI * (1.0 * uv.x + 8.0 * uv.y) + 4.4);
-  } else if (style == 1) {
-    // Waves: soft rounded bumps.
-    value += 0.8 * sin(TWO_PI * (1.0 * uv.x + 1.0 * uv.y) + 0.3);
-    value += 0.6 * sin(TWO_PI * (2.0 * uv.x - 1.0 * uv.y) + 1.7);
-    value += 0.5 * sin(TWO_PI * (1.0 * uv.x + 2.0 * uv.y) + 3.9);
-  } else if (style == 2) {
-    // Chunky: quantized into flat folded facets.
-    value += 0.7 * sin(TWO_PI * (1.0 * uv.x + 1.0 * uv.y) + 1.0);
-    value += 0.6 * sin(TWO_PI * (2.0 * uv.x + 1.0 * uv.y) + 2.5);
-    value = floor(value * 3.0 + 0.5) / 3.0;
-  } else {
-    // Cracks: ridged pattern with sharp painted creases.
-    value += 0.8 * (1.0 - abs(sin(TWO_PI * (2.0 * uv.x + 2.0 * uv.y) + 0.4)));
-    value += 0.7 * (1.0 - abs(sin(TWO_PI * (3.0 * uv.x - 2.0 * uv.y) + 1.9)));
-    value += 0.6 * (1.0 - abs(sin(TWO_PI * (2.0 * uv.x + 3.0 * uv.y) + 3.3)));
-  }
-  return value;
-}
-
-void shade(V2F inputs)
-{
-  vec3 V = normalize(camera_pos - inputs.position);
-  vec3 tangent = normalize(inputs.tangent);
-  vec3 bitangent = normalize(inputs.bitangent);
-
-  // World-space normal from the painted Normal channel (+ height / base normal).
-  vec3 N = computeWSNormal(inputs.sparse_coord, tangent, bitangent,
-                           normalize(inputs.normal));
-
-  // Perturb that normal with the chosen procedural pattern (unless "Off").
-  if (pattern != 4 && pattern_strength > 0.0) {
-    const float eps = 0.01;
-    vec2 uv = inputs.sparse_coord.tex_coord * pattern_scale;
-    float h = patternHeight(uv, pattern);
-    float hx = patternHeight(uv + vec2(eps, 0.0), pattern);
-    float hy = patternHeight(uv + vec2(0.0, eps), pattern);
-    vec2 slope = vec2((hx - h) / eps, (hy - h) / eps) * pattern_strength;
-    N = normalize(N - (tangent * slope.x + bitangent * slope.y));
-  }
-
-  // The lit viewport is built from diffuseShadingOutput() + specularShadingOutput()
-  // (the same outputs the built-in shaders use). albedoOutput() alone only shows
-  // in the "Base Color" debug view, so we never rely on it here.
-
-  // Mode 2: show the (patterned) normal directly as a colour.
-  if (shading_mode == 2) {
-    diffuseShadingOutput(clamp(N * 0.5 + 0.5, 0.0, 1.0));
-    specularShadingOutput(vec3(0.0));
-    return;
-  }
-
-  vec3 base = getBaseColor(basecolor_tex, inputs.sparse_coord);
-
-  // Mode 1: flat, unlit colour (useful to check the painted base).
-  if (shading_mode == 1) {
-    diffuseShadingOutput(base);
-    specularShadingOutput(vec3(0.0));
-    return;
-  }
-
-  // Mode 0: toon shading - quantize the diffuse term into hard bands.
-  float NdL = max(0.0, dot(N, light_dir));
-
-  // Optional drawn outline: leaving the outputs untouched renders black.
-  float NdV = max(0.0, dot(N, V));
-  if (outline_thickness > 0.0 && NdV < outline_thickness) {
-    return;
-  }
-
-  float steps = max(2.0, toon_steps);
-  float band = floor(NdL * steps) / steps;
-  float lighting = mix(ambient, 1.0, band) * light_intensity;
-
-  vec3 color = base * lighting;
-  diffuseShadingOutput(clamp(color, 0.0, 1.0));
-  specularShadingOutput(vec3(0.0));
-}
-'''
+    _apply_tone(heights, invert, contrast)
+    return _height_to_normal(heights, size, strength)
 
 
 # ==========================================================================
@@ -445,165 +425,154 @@ def _require_project():
     return True
 
 
-def _setup_normal_channel(*_):
-    """Make sure the active stack has a Normal (and Height) channel."""
-    if not _require_project():
-        return
+def _active_texture_set():
+    """Return the active TextureSet, or None with a printed message."""
+    try:
+        return substance_painter.textureset.get_active_stack().material()
+    except Exception as error:
+        print("Could not read the active Texture Set: %s" % error)
+        return None
+
+
+def _export_base_color(texture_set_name, size, dest_path):
+    """Render the Texture Set's base color to a PNG using the JS map export.
+
+    Returns True on success. This is how the "base material" sources get the
+    pixels that are currently painted, since the Python API cannot read them
+    directly.
+    """
+    js_path = dest_path.replace("\\", "/")
+    js_code = (
+        "(function(){"
+        "  try {"
+        "    alg.mapexport.save(%s, %s,"
+        "      {resolution:[%d, %d], bitDepth:8, dithering:'disabled'});"
+        "    return JSON.stringify({ok:true});"
+        "  } catch (e) {"
+        "    return JSON.stringify({ok:false, error:'' + e});"
+        "  }"
+        "})()"
+    ) % (json.dumps([texture_set_name, "base color"]), json.dumps(js_path),
+         size, size)
 
     try:
-        stack = substance_painter.textureset.get_active_stack()
-    except Exception as error:  # No active stack yet.
-        print("Could not get the active stack: %s" % error)
-        return
-
-    textureset = stack.material()
-    if textureset.is_layered_material():
-        print("This Texture Set uses material layering; channels are managed "
-              "by the shader and cannot be added here.")
-        return
-
-    channel_type = substance_painter.textureset.ChannelType
-    channel_format = substance_painter.textureset.ChannelFormat
-
-    # Normal channel: add it as an 8-bit RGB map if it is missing.
-    if stack.has_channel(channel_type.Normal):
-        normal = stack.get_channel(channel_type.Normal)
-        print("Normal channel already exists (format: %s)." % normal.format())
-    else:
-        stack.add_channel(channel_type.Normal, channel_format.RGB8)
-        print("Added a Normal channel (RGB8).")
-
-    # Height channel (L8) is handy for sculpting bumps that feed the normal.
-    if stack.has_channel(channel_type.Height):
-        print("Height channel already exists.")
-    else:
-        stack.add_channel(channel_type.Height, channel_format.L8)
-        print("Added a Height channel (L8).")
-
-    print("Ready: paint on the Normal / Height channels for a stylized look.")
+        result = substance_painter.js.evaluate(js_code)
+    except Exception as error:
+        print("Base color export failed: %s" % error)
+        return False
+    if not isinstance(result, dict) or not result.get("ok"):
+        detail = result.get("error") if isinstance(result, dict) else result
+        print("Base color export failed: %s" % detail)
+        print("(Does this Texture Set have a base color channel?)")
+        return False
+    return True
 
 
-def _generate_normal_texture(*_):
-    """Generate a stylized normal map, save it to the shelf and import it."""
+def _read_ui_settings():
+    """Collect the current panel settings into a dict."""
+    source = _source_combo.currentData()
+    return {
+        "source": source,
+        "style": _pattern_combo.currentData(),
+        "size": int(_size_combo.currentText()),
+        "strength": float(_strength_spin.value()),
+        "scale": int(_scale_spin.value()),
+        "octaves": int(_octaves_spin.value()),
+        "detail": _detail_spin.value() / 100.0,
+        "contrast": _contrast_spin.value() / 100.0,
+        "seed": int(_seed_spin.value()),
+        "invert": _invert_check.isChecked(),
+    }
+
+
+def _generate_and_apply(*_):
+    """Generate a normal map, save it, import it and set it as the mesh map."""
     if not _require_project():
         return
 
-    style = _style_combo.currentData() if _style_combo is not None else "painterly"
-    size = int(_size_combo.currentText()) if _size_combo is not None else 512
-    strength = float(_strength_spin.value()) if _strength_spin is not None else 3.0
-    seed = int(_seed_spin.value()) if _seed_spin is not None else 1
+    texture_set = _active_texture_set()
+    if texture_set is None:
+        return
+    settings = _read_ui_settings()
 
-    file_name = "stylized_normal_%s_%d_%d.png" % (style, size, seed)
-    print("Generating %s normal map %dx%d (seed %d)..." % (style, size, size, seed))
+    style_label = STYLE_DEFINITIONS[settings["style"]]["label"]
+    print("Generating %s normal map (%s, %dx%d, seed %d)..." % (
+        settings["source"], style_label, settings["size"], settings["size"],
+        settings["seed"]))
 
-    rgb = generate_normal_map(style, size, strength, seed)
+    base_rgb = None
+    if settings["source"] in ("material", "hybrid"):
+        temp_dir = os.path.join(tempfile.gettempdir(), "stylized_normals")
+        if not os.path.isdir(temp_dir):
+            os.makedirs(temp_dir)
+        base_path = os.path.join(temp_dir, "basecolor.png")
+        print("Reading base color from '%s'..." % texture_set.name())
+        if not _export_base_color(texture_set.name(), settings["size"], base_path):
+            return
+        width, height, base_rgb = read_png(base_path)
+        if (width, height) != (settings["size"], settings["size"]):
+            print("Note: base color came back as %dx%d; using it as is."
+                  % (width, height))
+            # Regenerate the height field at the size we actually got.
+            settings["size"] = width
 
-    # 1) Save the PNG inside the user shelf so it shows up in the Assets window.
+    try:
+        rgb = generate_normal_map(
+            settings["source"], settings["style"], settings["size"],
+            settings["strength"], settings["scale"], settings["octaves"],
+            settings["seed"], settings["detail"], settings["contrast"],
+            settings["invert"], base_rgb)
+    except Exception as error:
+        print("Generation failed: %s" % error)
+        return
+
+    # 1) Save into the user shelf so the map persists and is browsable.
+    file_name = "stylized_normal_%s_%s_%d_%d.png" % (
+        settings["source"], settings["style"], settings["size"], settings["seed"])
     textures_dir = _shelf_subdir("textures")
     shelf_file = os.path.join(textures_dir, file_name)
-    write_png(shelf_file, size, size, rgb)
+    write_png(shelf_file, settings["size"], settings["size"], rgb)
     substance_painter.resource.Shelves.refresh_all()
     print("Saved to shelf: %s" % shelf_file)
 
-    # 2) Embed a copy in the project as a texture resource.
+    # 2) Import into the project, then assign it as the Normal mesh map.
     try:
         resource = substance_painter.resource.import_project_resource(
             shelf_file,
             substance_painter.resource.Usage.TEXTURE,
             name=os.path.splitext(file_name)[0])
-        substance_painter.resource.show_resources_in_ui([resource])
-        print("Imported into the project and highlighted in the Assets window.")
     except Exception as error:
-        print("Shelf copy saved, but importing into the project failed: %s" % error)
+        print("Importing into the project failed: %s" % error)
+        return
 
-    print("Drag the texture onto a fill layer's Normal channel "
-          "(or add a Fill layer, then set its Normal channel).")
-
-
-def _install_shader():
-    """Write the stylized shader into the user shelf."""
-    shaders_dir = _shelf_subdir("shaders")
-    shader_path = os.path.join(shaders_dir, SHADER_FILE_NAME)
-    with open(shader_path, "w", encoding="utf-8") as handle:
-        handle.write(STYLIZED_SHADER)
-    substance_painter.resource.Shelves.refresh_all()
-    return shader_path
-
-
-def _find_shader_resource():
-    """Find the installed shader as a Painter resource, or return None."""
-    stem = os.path.splitext(SHADER_FILE_NAME)[0]
     try:
-        shelf = substance_painter.resource.Shelves.user_shelf()
-        candidates = shelf.resources()
-    except Exception:
-        candidates = []
-    for resource in candidates:
-        try:
-            identifier = resource.identifier()
-        except Exception:
-            continue
-        name = (identifier.name or "").lower()
-        if name == SHADER_FILE_NAME.lower() or name == stem.lower():
-            return resource
-    return None
+        texture_set.set_mesh_map_resource(
+            substance_painter.textureset.MeshMapUsage.Normal,
+            resource.identifier())
+        print("Applied to the Normal mesh map of '%s'." % texture_set.name())
+    except Exception as error:
+        print("Could not set the Normal mesh map: %s" % error)
+        print("The texture is still in your shelf; drag it onto the Normal "
+              "channel to use it manually.")
+        substance_painter.resource.show_resources_in_ui([resource])
+        return
+
+    substance_painter.resource.show_resources_in_ui([resource])
 
 
-def _install_shader_clicked(*_):
-    """Button handler: install the shader and explain how to use it."""
-    path = _install_shader()
-    print("Installed stylized shader: %s" % path)
-    print("Use 'Apply stylized shader' to switch the viewport, or pick it in "
-          "Display Settings > Shaders.")
-
-
-def _apply_shader(*_):
-    """Switch the project's shader instances over to the stylized shader."""
+def _revert_normal_map(*_):
+    """Unset the Normal mesh map so the project goes back to its bake."""
     if not _require_project():
         return
-
-    resource = _find_shader_resource()
-    if resource is None:
-        print("Shader not found in the shelf. Click 'Install stylized shader' first.")
+    texture_set = _active_texture_set()
+    if texture_set is None:
         return
-
-    shader_url = resource.identifier().url()
-
-    # Drive the legacy JavaScript API through Python. `updateShaderInstance`
-    # replaces the shader used by a shader instance (shaderId, shaderUrl).
-    js_code = (
-        "(function(){"
-        "  var url = %s;"
-        "  var result = [];"
-        "  var shaders = alg.shaders.instances();"
-        "  for (var i = 0; i < shaders.length; i++) {"
-        "    try {"
-        "      alg.shaders.updateShaderInstance(shaders[i].id, url);"
-        "      result.push({id: shaders[i].id, label: shaders[i].label, ok: true});"
-        "    } catch (e) {"
-        "      result.push({id: shaders[i].id, label: shaders[i].label,"
-        "                  ok: false, error: '' + e});"
-        "    }"
-        "  }"
-        "  return JSON.stringify(result);"
-        "})()"
-    ) % json.dumps(shader_url)
-
     try:
-        results = substance_painter.js.evaluate(js_code)
+        texture_set.set_mesh_map_resource(
+            substance_painter.textureset.MeshMapUsage.Normal, None)
+        print("Cleared the Normal mesh map of '%s'." % texture_set.name())
     except Exception as error:
-        print("Applying the shader failed: %s" % error)
-        return
-
-    if not results:
-        print("No shader instance found to update.")
-        return
-    for entry in results:
-        state = "ok" if entry.get("ok") else "failed: %s" % entry.get("error")
-        print("Shader instance %s (%s): %s" %
-              (entry.get("id"), entry.get("label"), state))
-    print("Done. If the look did not change, pick the shader manually in "
-          "Display Settings > Shaders.")
+        print("Could not clear the Normal mesh map: %s" % error)
 
 
 def _clear_output(*_):
@@ -613,7 +582,7 @@ def _clear_output(*_):
 
 
 # ==========================================================================
-# Panel / UI wiring (mirrors painter_bridge.py conventions).
+# Panel / UI wiring.
 # ==========================================================================
 class _OutputRedirect(object):
     """Mirror text written with print() into the panel and the real console."""
@@ -646,7 +615,9 @@ def _show_panel(*_):
 
 def _build_panel():
     """Create the panel widget and return it."""
-    global _output_box, _style_combo, _size_combo, _strength_spin, _seed_spin
+    global _output_box, _source_combo, _pattern_combo, _size_combo
+    global _strength_spin, _scale_spin, _octaves_spin, _detail_spin
+    global _contrast_spin, _seed_spin, _invert_check
 
     panel = QtWidgets.QWidget()
     panel.setObjectName(PANEL_NAME)  # Lets Painter save/restore dock geometry.
@@ -658,66 +629,82 @@ def _build_panel():
     layout.setSpacing(6)
 
     info = QtWidgets.QLabel(
-        "Tools for a hand-painted, stylized look driven by normal maps.\n"
-        "Painter's scripting cannot create paint layers, so generate maps here "
-        "and paint on the Normal channel for the rest.")
+        "Generate a stylized normal map and apply it straight to the Normal "
+        "mesh map of the active Texture Set.\n"
+        "Base it on a procedural pattern, on your painted base color, or mix "
+        "the two.")
     info.setWordWrap(True)
     layout.addWidget(info)
 
-    # --- Group 1: Normal channel setup ------------------------------------
-    group1 = QtWidgets.QGroupBox("1. Normal channel")
-    box1 = QtWidgets.QVBoxLayout(group1)
-    setup_button = QtWidgets.QPushButton("Set up Normal channel")
-    setup_button.clicked.connect(_setup_normal_channel)
-    box1.addWidget(setup_button)
-    layout.addWidget(group1)
+    # --- Source + pattern --------------------------------------------------
+    source_group = QtWidgets.QGroupBox("Height source")
+    form = QtWidgets.QFormLayout(source_group)
 
-    # --- Group 2: Stylized normal maps ------------------------------------
-    group2 = QtWidgets.QGroupBox("2. Stylized normal maps")
-    form = QtWidgets.QFormLayout(group2)
+    _source_combo = QtWidgets.QComboBox()
+    _source_combo.addItem("Procedural pattern", "procedural")
+    _source_combo.addItem("Base material (base color)", "material")
+    _source_combo.addItem("Base material + pattern detail", "hybrid")
+    form.addRow("Source", _source_combo)
 
-    _style_combo = QtWidgets.QComboBox()
-    for key, label in STYLE_DESCRIPTIONS.items():
-        _style_combo.addItem(label, key)
-    form.addRow("Style", _style_combo)
+    _pattern_combo = QtWidgets.QComboBox()
+    for key, definition in STYLE_DEFINITIONS.items():
+        _pattern_combo.addItem(definition["label"], key)
+    form.addRow("Pattern", _pattern_combo)
+    layout.addWidget(source_group)
+
+    # --- Generation controls ----------------------------------------------
+    controls_group = QtWidgets.QGroupBox("Generation controls")
+    form2 = QtWidgets.QFormLayout(controls_group)
 
     _size_combo = QtWidgets.QComboBox()
-    _size_combo.addItems(["256", "512", "1024"])
-    _size_combo.setCurrentText("512")
-    form.addRow("Size", _size_combo)
+    _size_combo.addItems(["256", "512", "1024", "2048"])
+    _size_combo.setCurrentText("1024")
+    form2.addRow("Size", _size_combo)
 
     _strength_spin = QtWidgets.QSpinBox()
-    _strength_spin.setRange(1, 10)
-    _strength_spin.setValue(3)
-    form.addRow("Strength", _strength_spin)
+    _strength_spin.setRange(1, 20)
+    _strength_spin.setValue(4)
+    form2.addRow("Strength", _strength_spin)
+
+    _scale_spin = QtWidgets.QSpinBox()
+    _scale_spin.setRange(1, 16)
+    _scale_spin.setValue(4)
+    form2.addRow("Pattern scale", _scale_spin)
+
+    _octaves_spin = QtWidgets.QSpinBox()
+    _octaves_spin.setRange(1, 6)
+    _octaves_spin.setValue(3)
+    form2.addRow("Octaves (detail)", _octaves_spin)
+
+    _detail_spin = QtWidgets.QSpinBox()
+    _detail_spin.setRange(0, 100)
+    _detail_spin.setValue(50)
+    _detail_spin.setSuffix(" %")
+    form2.addRow("Pattern mix (hybrid)", _detail_spin)
+
+    _contrast_spin = QtWidgets.QSpinBox()
+    _contrast_spin.setRange(25, 400)
+    _contrast_spin.setValue(100)
+    _contrast_spin.setSuffix(" %")
+    form2.addRow("Contrast", _contrast_spin)
 
     _seed_spin = QtWidgets.QSpinBox()
     _seed_spin.setRange(0, 999999)
     _seed_spin.setValue(1)
-    form.addRow("Seed", _seed_spin)
+    form2.addRow("Seed", _seed_spin)
 
-    generate_button = QtWidgets.QPushButton("Generate & import normal map")
-    generate_button.clicked.connect(_generate_normal_texture)
-    form.addRow(generate_button)
-    layout.addWidget(group2)
+    _invert_check = QtWidgets.QCheckBox("Invert height")
+    form2.addRow(_invert_check)
+    layout.addWidget(controls_group)
 
-    # --- Group 3: Stylized shader -----------------------------------------
-    group3 = QtWidgets.QGroupBox("3. Stylized shader")
-    box3 = QtWidgets.QVBoxLayout(group3)
-    install_button = QtWidgets.QPushButton("Install stylized shader")
-    install_button.clicked.connect(_install_shader_clicked)
-    box3.addWidget(install_button)
-    apply_button = QtWidgets.QPushButton("Apply stylized shader to viewport")
-    apply_button.clicked.connect(_apply_shader)
-    box3.addWidget(apply_button)
-    hint3 = QtWidgets.QLabel(
-        "Tip: the shader has its own live controls. In Display Settings > "
-        "Shaders, set Pattern to Painterly / Waves / Chunky / Cracks to change "
-        "the stylized normal straight away. Use 'Normal debug' from Shading "
-        "mode to see it clearly.")
-    hint3.setWordWrap(True)
-    box3.addWidget(hint3)
-    layout.addWidget(group3)
+    # --- Actions -----------------------------------------------------------
+    generate_button = QtWidgets.QPushButton("Generate & apply to Normal map")
+    generate_button.clicked.connect(_generate_and_apply)
+    layout.addWidget(generate_button)
+
+    revert_button = QtWidgets.QPushButton("Revert Normal mesh map")
+    revert_button.clicked.connect(_revert_normal_map)
+    layout.addWidget(revert_button)
 
     # --- Output ------------------------------------------------------------
     _output_box = QtWidgets.QPlainTextEdit()
@@ -781,7 +768,9 @@ def start_plugin():
 def close_plugin():
     """Called by Painter when the plugin is disabled."""
     global _original_stdout, _panel, _dock, _toolbar_button, _menu_action
-    global _output_box, _style_combo, _size_combo, _strength_spin, _seed_spin
+    global _output_box, _source_combo, _pattern_combo, _size_combo
+    global _strength_spin, _scale_spin, _octaves_spin, _detail_spin
+    global _contrast_spin, _seed_spin, _invert_check
 
     if _original_stdout is not None:
         sys.stdout = _original_stdout
@@ -800,10 +789,16 @@ def close_plugin():
     _panel = None
     _dock = None
     _output_box = None
-    _style_combo = None
+    _source_combo = None
+    _pattern_combo = None
     _size_combo = None
     _strength_spin = None
+    _scale_spin = None
+    _octaves_spin = None
+    _detail_spin = None
+    _contrast_spin = None
     _seed_spin = None
+    _invert_check = None
 
 
 if __name__ == "__main__":
