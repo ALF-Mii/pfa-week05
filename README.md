@@ -116,7 +116,8 @@ with no clicking in the app.
 
 ## Recording (one minute or less)
 
-The screen capture should show the terminal **and** Painter side by side, then:
+The screen capture should show the terminal **and** Painter side by side, then: 
+https://drive.google.com/file/d/1aDZLCLMAqJoc6Cri3Qv6NVkKYWaK3sP0/view?usp=sharing
 
 1. Show the **Painter Bridge** panel already listening.
 2. In the terminal, ask for the one thing in plain words, then run the
