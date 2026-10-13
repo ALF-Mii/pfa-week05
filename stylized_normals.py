@@ -10,11 +10,11 @@ two comboboxes:
     Stripes, Scales, Rings, Noise, Fabric) that perturb the normal *live*, so
     switching styles updates the viewport instantly - no bitmap to bake.
 
-The panel mirrors those two combos for quick switching, and adds buttons to
-install/update the shader, apply it to the viewport, and restore whatever
-shader was active before. Every other tweak (strength, toon steps, outline,
-halftone density, posterize, hue shift, ...) lives in
-**Display Settings > Shaders**, where the shader's parameters are shown.
+The panel mirrors those two combos for quick switching, adds sliders for every
+tunable parameter, and has buttons to install/update the shader, apply it to the
+viewport, reset back to normal (default PBR) shading, and restore whatever
+shader was active before. Every parameter is also shown in
+**Display Settings > Shaders**.
 
 Install:
   1. Copy this file into Painter's Python plugin folder, for example:
@@ -83,6 +83,28 @@ STYLE_OPTIONS = [
     ("Fabric", 9),
 ]
 
+# The fine-tuning sliders shown in the panel. Each entry is
+#   (identifier, label, minimum, maximum, step, default, decimals)
+# They map 1:1 to the float uniforms in STYLIZED_SHADER, so moving a slider
+# pushes the value straight into the live shader (same thing you'd do by hand
+# in Display Settings > Shaders, just handier). Keep the ranges in sync with
+# the "min"/"max" hints in the shader source above.
+PANEL_PARAMS = [
+    ("style_scale", "Style scale", 0.5, 40.0, 0.5, 6.0, 1),
+    ("style_strength", "Style strength", 0.0, 2.0, 0.05, 0.25, 2),
+    ("toon_steps", "Toon steps", 2.0, 24.0, 0.5, 4.0, 1),
+    ("light_intensity", "Light intensity", 0.0, 3.0, 0.05, 1.0, 2),
+    ("ambient", "Ambient", 0.0, 1.0, 0.02, 0.15, 2),
+    ("outline_thickness", "Outline (0 = off)", 0.0, 0.5, 0.01, 0.0, 2),
+    ("rim_strength", "Rim / X-ray strength", 0.0, 2.0, 0.05, 0.5, 2),
+    ("rim_power", "Rim / X-ray falloff", 0.5, 8.0, 0.1, 2.0, 1),
+    ("hatch_scale", "Hatch density", 4.0, 120.0, 1.0, 24.0, 0),
+    ("screen_scale", "Halftone density", 4.0, 120.0, 1.0, 24.0, 0),
+    ("posterize", "Posterize (0 = off)", 0.0, 12.0, 1.0, 0.0, 0),
+    ("saturation", "Saturation", 0.0, 3.0, 0.05, 1.0, 2),
+    ("hue_shift", "Hue shift (rad)", -3.14, 3.14, 0.02, 0.0, 2),
+]
+
 # Module level handles (kept so we can clean everything up on unload).
 _output_box = None  # Text box that mirrors print() output.
 _original_stdout = None  # Saved so print() can be restored on unload.
@@ -94,6 +116,9 @@ _shader_type_combo = None  # Shader type combo in the panel.
 _style_combo = None  # Style combo in the panel.
 _ui_ready = False  # Suppresses combo callbacks while the panel is being built.
 _previous_shader_urls = None  # Instance urls saved before we switch shader.
+_sliders = {}  # identifier -> (QSlider, QLabel) for the fine-tuning sliders.
+_slider_timer = None  # Debounces slider drags into a single shader update.
+_pending_params = {}  # identifier -> value waiting to be pushed to the shader.
 
 # ==========================================================================
 # The shader itself. Written verbatim into the user shelf when installed.
@@ -432,6 +457,37 @@ def _find_shader_resource():
     return None
 
 
+# Name of Painter's built-in "normal" shader. Switching back to this is how we
+# undo the stylized look and return to ordinary PBR shading.
+DEFAULT_SHADER_NAME = "pbr-metal-rough"
+
+
+def _find_default_shader_resource():
+    """Return the shelf Resource for Painter's default PBR shader, or None."""
+    shelves = []
+    for getter in ("application_shelf", "project_shelf"):
+        try:
+            shelves.append(getattr(substance_painter.resource.Shelves, getter)())
+        except Exception:
+            continue
+    for shelf in shelves:
+        try:
+            resources = shelf.resources()
+        except Exception as error:
+            print("Could not read a shelf: %s" % error)
+            continue
+        for resource in resources:
+            try:
+                if resource.type() != substance_painter.resource.Type.SHADER:
+                    continue
+            except Exception:
+                continue
+            name = resource.identifier().name.split("/")[-1]
+            if name == DEFAULT_SHADER_NAME:
+                return resource
+    return None
+
+
 def _wait_for_shader(timeout=10.0):
     """Poll the shelf (it crawls asynchronously) until our shader appears."""
     deadline = time.time() + timeout
@@ -463,6 +519,24 @@ def _instance_urls():
     return []
 
 
+def _switch_shader(url):
+    """Point every shader instance of the project at the given shader url.
+
+    Returns the (dict) result of the JavaScript call, or None if there is no
+    JavaScript bridge. Shared by "Apply to viewport" and "Reset to normal".
+    """
+    return _js_eval(
+        "(function(){"
+        "  try {"
+        "    var list = alg.shaders.instances();"
+        "    for (var i = 0; i < list.length; i++){"
+        "      alg.shaders.updateShaderInstance(list[i].id, %s);"
+        "    }"
+        "    return {ok:true, count: list.length};"
+        "  } catch (e) { return {ok:false, error:'' + e}; }"
+        "})()" % json.dumps(url))
+
+
 def _apply_shader(*_):
     """Switch every shader instance of the project over to our shader."""
     if not _require_project():
@@ -480,16 +554,7 @@ def _apply_shader(*_):
 
     url = resource.identifier().url()
     print("Applying shader: %s" % url)
-    result = _js_eval(
-        "(function(){"
-        "  try {"
-        "    var list = alg.shaders.instances();"
-        "    for (var i = 0; i < list.length; i++){"
-        "      alg.shaders.updateShaderInstance(list[i].id, %s);"
-        "    }"
-        "    return {ok:true, count: list.length};"
-        "  } catch (e) { return {ok:false, error:'' + e}; }"
-        "})()" % json.dumps(url))
+    result = _switch_shader(url)
 
     if isinstance(result, dict) and result.get("ok"):
         print("Applied to %d shader instance(s)." % result.get("count", 0))
@@ -534,8 +599,45 @@ def _restore_shader(*_):
         print("Could not restore the previous shader: %s" % detail)
 
 
-def _set_parameter(identifier, value):
-    """Set one shader parameter on every instance running our shader."""
+def _reset_shading(*_):
+    """Return the viewport to ordinary PBR shading (undo the stylized look)."""
+    global _previous_shader_urls
+
+    if not _require_project():
+        return
+
+    resource = _find_default_shader_resource()
+    if resource is None:
+        # We could not find the built-in shader; fall back to whatever was
+        # active before we applied ours (if we know).
+        if _previous_shader_urls:
+            print("Could not find the default shader; restoring the previous "
+                  "one instead.")
+            _restore_shader()
+            return
+        print("Could not find the default shader ('%s')." % DEFAULT_SHADER_NAME)
+        print("Pick any shader manually in Display Settings > Shaders.")
+        return
+
+    url = resource.identifier().url()
+    print("Returning to the default shader: %s" % url)
+    result = _switch_shader(url)
+    if isinstance(result, dict) and result.get("ok"):
+        # The stylized look is gone, so our "Restore previous" is spent too.
+        _previous_shader_urls = None
+        print("Back to normal shading (%d instance(s))." % result.get("count", 0))
+    else:
+        detail = result.get("error") if isinstance(result, dict) else result
+        print("Could not switch back automatically: %s" % detail)
+        print("You can select a shader manually in Display Settings > Shaders.")
+
+
+def _set_parameters(values, quiet=False):
+    """Set several shader parameters on every instance running our shader."""
+    if not values:
+        return
+    pairs = ", ".join("%s: %s" % (json.dumps(str(key)), json.dumps(val))
+                      for key, val in values.items())
     js_code = (
         "(function(){"
         "  try {"
@@ -543,20 +645,25 @@ def _set_parameter(identifier, value):
         "    var changed = 0;"
         "    for (var i = 0; i < list.length; i++){"
         "      if (String(list[i].shader).indexOf(%s) >= 0){"
-        "        alg.shaders.setParameters(list[i].id, { %s: %s });"
+        "        alg.shaders.setParameters(list[i].id, { %s });"
         "        changed++;"
         "      }"
         "    }"
         "    return {ok:true, count: changed};"
         "  } catch (e) { return {ok:false, error:'' + e}; }"
-        "})()" % (json.dumps(SHADER_NAME), identifier, json.dumps(value)))
+        "})()" % (json.dumps(SHADER_NAME), pairs))
     result = _js_eval(js_code)
     if not (isinstance(result, dict) and result.get("ok")):
         detail = result.get("error") if isinstance(result, dict) else result
-        print("Could not set '%s': %s" % (identifier, detail))
+        print("Could not set %s: %s" % (list(values), detail))
         return
-    if not result.get("count"):
+    if not result.get("count") and not quiet:
         print("The stylized shader is not active. Press 'Apply to viewport'.")
+
+
+def _set_parameter(identifier, value):
+    """Set one shader parameter (thin wrapper around _set_parameters)."""
+    _set_parameters({identifier: value})
 
 
 def _on_combo_changed(identifier, combo):
@@ -567,6 +674,30 @@ def _on_combo_changed(identifier, combo):
         print("No project is open.")
         return
     _set_parameter(identifier, combo.currentData())
+
+
+def _on_slider_changed(identifier, value, label, decimals):
+    """Callback for a fine-tuning slider.
+
+    The label updates immediately; the shader update is debounced through a
+    short timer so dragging a slider sends one change per pause instead of a
+    flood of them.
+    """
+    label.setText(("%." + str(decimals) + "f") % value)
+    if not _ui_ready:
+        return
+    _pending_params[identifier] = value
+    if _slider_timer is not None:
+        _slider_timer.start()
+
+
+def _push_pending_params():
+    """Send every parameter queued by the sliders to the live shader."""
+    global _pending_params
+    values = _pending_params
+    _pending_params = {}
+    if values and substance_painter.project.is_open():
+        _set_parameters(values, quiet=True)
 
 
 def _clear_output(*_):
@@ -607,23 +738,51 @@ def _show_panel(*_):
         _panel.show()
 
 
+def _make_slider(identifier, label, minimum, maximum, step, default, decimals):
+    """Build one slider row for a shader parameter and add it to a form layout.
+
+    A QSlider only works in integers, so we map its 0..N range onto the real
+    float range (minimum .. maximum) in steps of `step`.
+    """
+    steps = int(round((maximum - minimum) / step))
+    slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+    slider.setMinimum(0)
+    slider.setMaximum(steps)
+    slider.setValue(int(round((default - minimum) / step)))
+
+    value_label = QtWidgets.QLabel(("%." + str(decimals) + "f") % default)
+    value_label.setMinimumWidth(46)
+    value_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+
+    def on_change(position):
+        value = minimum + position * step
+        _on_slider_changed(identifier, value, value_label, decimals)
+
+    slider.valueChanged.connect(on_change)
+
+    row = QtWidgets.QWidget()
+    row_layout = QtWidgets.QHBoxLayout(row)
+    row_layout.setContentsMargins(0, 0, 0, 0)
+    row_layout.setSpacing(6)
+    row_layout.addWidget(slider, 1)
+    row_layout.addWidget(value_label)
+
+    _sliders[identifier] = (slider, value_label)
+    return label, row
+
+
 def _build_panel():
     """Create the panel widget and return it."""
-    global _output_box, _shader_type_combo, _style_combo
+    global _output_box, _shader_type_combo, _style_combo, _slider_timer, _sliders
 
-    panel = QtWidgets.QWidget()
-    panel.setObjectName(PANEL_NAME)  # Lets Painter save/restore dock geometry.
-    panel.setWindowTitle("Stylized Shader")
-    panel.setWindowIcon(QtWidgets.QApplication.style().standardIcon(
-        QtWidgets.QStyle.SP_FileDialogDetailedView))
-
-    layout = QtWidgets.QVBoxLayout(panel)
+    content = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(content)
     layout.setSpacing(6)
 
     info = QtWidgets.QLabel(
         "A stylized surface shader with many looks.\n"
         "Install it, apply it to the viewport, then pick a Shader type and a "
-        "Style below (or tweak everything in Display Settings > Shaders).")
+        "Style and fine-tune with the sliders below.")
     info.setWordWrap(True)
     layout.addWidget(info)
 
@@ -646,16 +805,41 @@ def _build_panel():
     form.addRow("Style", _style_combo)
     layout.addWidget(live_group)
 
+    # --- Fine-tuning sliders ----------------------------------------------
+    fine_group = QtWidgets.QGroupBox("Fine-tuning")
+    fine_form = QtWidgets.QFormLayout(fine_group)
+    _sliders = {}
+    for params in PANEL_PARAMS:
+        label, row = _make_slider(*params)
+        fine_form.addRow(label, row)
+    layout.addWidget(fine_group)
+
+    # Debounces slider drags so one pause sends one shader update, not dozens.
+    _slider_timer = QtCore.QTimer()
+    _slider_timer.setSingleShot(True)
+    _slider_timer.setInterval(120)
+    _slider_timer.timeout.connect(_push_pending_params)
+
     # --- Actions -----------------------------------------------------------
     install_button = QtWidgets.QPushButton("Install / update shader")
+    install_button.setToolTip("Write the shader into your user shelf")
     install_button.clicked.connect(_install_shader)
     layout.addWidget(install_button)
 
     apply_button = QtWidgets.QPushButton("Apply to viewport")
+    apply_button.setToolTip("Switch the viewport over to the stylized shader")
     apply_button.clicked.connect(_apply_shader)
     layout.addWidget(apply_button)
 
+    reset_button = QtWidgets.QPushButton("Reset to normal shading")
+    reset_button.setToolTip(
+        "Return to Painter's default shader (undo the stylized look)")
+    reset_button.clicked.connect(_reset_shading)
+    layout.addWidget(reset_button)
+
     restore_button = QtWidgets.QPushButton("Restore previous shader")
+    restore_button.setToolTip(
+        "Put back exactly the shader that was active before you applied this")
     restore_button.clicked.connect(_restore_shader)
     layout.addWidget(restore_button)
 
@@ -669,7 +853,15 @@ def _build_panel():
     clear_button.clicked.connect(_clear_output)
     layout.addWidget(clear_button)
 
-    return panel
+    # The panel is long, so put everything inside a scroll area.
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setObjectName(PANEL_NAME)  # Lets Painter save/restore dock geometry.
+    scroll.setWindowTitle("Stylized Shader")
+    scroll.setWindowIcon(QtWidgets.QApplication.style().standardIcon(
+        QtWidgets.QStyle.SP_FileDialogDetailedView))
+    scroll.setWidget(content)
+    return scroll
 
 
 def _add_toolbar_button():
@@ -723,6 +915,7 @@ def close_plugin():
     """Called by Painter when the plugin is disabled."""
     global _original_stdout, _panel, _dock, _toolbar_button, _menu_action
     global _output_box, _shader_type_combo, _style_combo, _ui_ready
+    global _sliders, _slider_timer
 
     _ui_ready = False
 
@@ -745,6 +938,14 @@ def close_plugin():
     _output_box = None
     _shader_type_combo = None
     _style_combo = None
+    _sliders = {}
+    if _slider_timer is not None:
+        try:
+            _slider_timer.stop()
+        except Exception:
+            pass
+    _slider_timer = None
+    _pending_params.clear()
 
 
 if __name__ == "__main__":
